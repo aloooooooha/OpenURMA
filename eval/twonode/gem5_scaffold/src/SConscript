@@ -11,8 +11,10 @@ import os
 
 Import('*')
 
-SimObject('UBController.py', sim_objects=['UBController'])
-Source('UBController.cc')
+# UBController is the OLD architecture (wrapper around NIC_TLM facade).
+# Replaced by NICTopologySC in the Phase H' Clean Architecture.
+# SimObject('UBController.py', sim_objects=['UBController'])
+# Source('UBController.cc')
 
 SimObject('NICTopologySC.py', sim_objects=['NICTopologySC'])
 Source('NICTopologySC.cc')
@@ -20,8 +22,9 @@ Source('NICTopologySC.cc')
 SimObject('WireLoopback.py', sim_objects=['WireLoopback'])
 Source('WireLoopback.cc')
 
-SimObject('NICTopologyRoCE.py', sim_objects=['NICTopologyRoCE'])
-Source('NICTopologyRoCE.cc')
+# NICTopologyRoCE disabled — requires OpenRoCE TLM topology lib built separately
+# SimObject('NICTopologyRoCE.py', sim_objects=['NICTopologyRoCE'])
+# Source('NICTopologyRoCE.cc')
 
 # CqRegister was folded into NICTopologySC for the Phase H' Clean
 # Architecture cut — a single Gem5ToTlmBridge512 covers the full
@@ -32,6 +35,7 @@ Source('NICTopologyRoCE.cc')
 DebugFlag('UBController')
 
 OPENURMA_ROOT = os.environ.get('OPENURMA_ROOT', '/home/ubuntu/OpenURMA')
+OPENCLICKNP_ROOT = os.environ.get('OPENCLICKNP_ROOT', '/home/ubuntu/OpenClickNP')
 env.Append(CPPPATH=[
     os.path.join(OPENURMA_ROOT, 'runtime/openurma/include'),
     os.path.join(OPENURMA_ROOT, 'build/openurma_gen/systemc'),
@@ -44,11 +48,17 @@ env.Append(CPPPATH=[
     # topology_tlm.cpp; the file's namespace was renamed
     # (openurma::sc::tlm_topo → openroce::sc::tlm_topo) by
     # build_libsc_roce_tlm_gem5.sh so symbols don't collide at link.
-    '/home/ubuntu/OpenClickNP/runtime/include',
+    os.path.join(OPENCLICKNP_ROOT, 'runtime/include'),
 ])
-env.Append(LIBS=['openurma_sc_tlm'])
-# Use the gem5-ABI build (build/sc_gem5_tlm), NOT the system-SystemC
-# build (build/sc_tlm). Linking the latter into gem5.opt fails with
-# "undefined reference to sc_object::add_child_event" because gem5
-# embeds its own SystemC with a different sc_object vtable layout.
-env.Append(LIBPATH=[os.path.join(OPENURMA_ROOT, 'build/sc_gem5_tlm')])
+# NICTopologySC.cc includes topology_tlm.cpp directly (inline),
+# so we do NOT link libopenurma_sc_tlm.a — it would cause a
+# multiple-definition error for Topology::kModuleNames.
+# env.Append(LIBS=['openurma_sc_tlm'])
+# env.Append(LIBPATH=[os.path.join(OPENURMA_ROOT, 'build/sc_gem5_tlm')])
+
+# sc_main stub: gem5's SystemC kernel requires sc_main() to be defined
+# for the SC elaboration phase (before_end_of_elaboration) which fires
+# sendRangeChange() on the Gem5ToTlmBridge. The facade provides one but
+# we can't link it due to the ODR issue above. This tiny stub satisfies
+# the linker without pulling in the duplicate Topology.
+Source('sc_main_stub.cc')

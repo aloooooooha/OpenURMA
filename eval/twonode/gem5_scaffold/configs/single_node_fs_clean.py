@@ -32,8 +32,8 @@ import m5
 from m5.objects import *
 from m5.util import addToPath
 
-addToPath("/home/ubuntu/gem5/configs/")
-addToPath("/home/ubuntu/gem5/configs/example/arm")
+addToPath("/home/xinzhang/gem5/configs/")
+addToPath("/home/xinzhang/gem5/configs/example/arm")
 
 from common import SysPaths
 import devices
