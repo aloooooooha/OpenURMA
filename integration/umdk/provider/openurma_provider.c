@@ -20,6 +20,7 @@
 #include <stdio.h>
 #include <pthread.h>
 #include <stdatomic.h>
+#include <stdarg.h>
 #include <errno.h>
 #include <unistd.h>
 #include <sys/eventfd.h>
@@ -53,21 +54,74 @@ static inline void flit_set_eop(uint8_t* f, int b){ f[32] = (f[32]&~0x02)|(b?0x0
 #define NTH_NLP_RTPH 0x2
 
 // ---- logging ----
-static int g_log = -1;
+static int g_log_level = -1;
 static int g_backstop = -1;
-static inline int backstop(void){ if(g_backstop<0){const char*e=getenv("OPENURMA_BACKSTOP");g_backstop=e?atoi(e):40;} return g_backstop; }
-static inline int log_on(void){ if(g_log<0){const char*e=getenv("OPENURMA_PROVIDER_LOG");g_log=(e&&*e&&*e!='0')?1:0;} return g_log; }
-#define PLOG(...) do{ if(log_on()){fprintf(stderr,"[openurma-prov] " __VA_ARGS__);fputc('\n',stderr);} }while(0)
+static int g_trace_limit = -1;
+static atomic_uint g_trace_events;
+static inline uint32_t backstop(void){
+    if(g_backstop<0){const char*e=getenv("OPENURMA_BACKSTOP");g_backstop=e?atoi(e):40;}
+    return g_backstop > 0 ? (uint32_t)g_backstop : 40u;
+}
+static inline int provider_log_level(void)
+{
+    if (g_log_level < 0) {
+        const char *value = getenv("OPENURMA_PROVIDER_LOG");
+        if (value == NULL || *value == '\0' || strcmp(value, "0") == 0 ||
+            strcmp(value, "off") == 0 || strcmp(value, "error") == 0) {
+            g_log_level = 0;
+        } else if (strcmp(value, "1") == 0 || strcmp(value, "summary") == 0) {
+            g_log_level = 1;
+        } else if (strcmp(value, "trace") == 0) {
+            g_log_level = 2;
+        } else {
+            fprintf(stderr, "[openurma-prov] invalid OPENURMA_PROVIDER_LOG=%s; using off\n", value);
+            g_log_level = 0;
+        }
+    }
+    return g_log_level;
+}
+static inline unsigned provider_trace_limit(void)
+{
+    if (g_trace_limit < 0) {
+        const char *value = getenv("OPENURMA_PROVIDER_TRACE_LIMIT");
+        char *end = NULL;
+        unsigned long parsed = value ? strtoul(value, &end, 10) : 256ul;
+        g_trace_limit = value && (*value == '\0' || *end != '\0' || parsed > 100000ul)
+            ? 256 : (int)parsed;
+    }
+    return (unsigned)g_trace_limit;
+}
+static void provider_trace(const char *format, ...)
+{
+    unsigned index = atomic_fetch_add(&g_trace_events, 1);
+    unsigned limit = provider_trace_limit();
+    if (index > limit) return;
+    if (index == limit) {
+        fprintf(stderr, "[openurma-prov] trace suppressed limit=%u\n", limit);
+        return;
+    }
+    va_list args;
+    va_start(args, format);
+    fprintf(stderr, "[openurma-prov] ");
+    vfprintf(stderr, format, args);
+    fputc('\n', stderr);
+    va_end(args);
+}
+#define ELOG(...) do{fprintf(stderr,"[openurma-prov] " __VA_ARGS__);fputc('\n',stderr);}while(0)
+#define PLOG(...) do{if(provider_log_level()>=1){fprintf(stderr,"[openurma-prov] " __VA_ARGS__);fputc('\n',stderr);}}while(0)
+#define TLOG(...) do{if(provider_log_level()>=2){provider_trace(__VA_ARGS__);}}while(0)
 
 // ---- data side-channel tags ----
-#define D_WRITE 'W'   // [remote_va u64][len u32][bytes]
+#define D_WRITE 'W'   // [remote_va u64][token u32][len u32][req u32][bytes]
+#define D_WRITEACK 'A' // [req u32][status u32]
 #define D_SEND  'S'   // [dst_jid u32][len u32][bytes]
-#define D_READRQ 'R'  // [remote_va u64][len u32][req u32][src_cna u32]
-#define D_READRSP 'r' // [req u32][len u32][bytes]   (delivered to local_va kept in outstanding)
+#define D_READRQ 'R'  // [remote_va u64][token u32][len u32][req u32][src_cna u32]
+#define D_READRSP 'r' // [req u32][len u32][status u32][bytes]
 
 // ---- handles ----
 #define MAX_RECV 256
 #define MAX_OUT  4096
+#define MAX_DATA_FRAME_BODY ((uint32_t)((1u << 16) - 2u))
 
 struct ou_jfc {
     urma_jfc_t base;
@@ -88,7 +142,7 @@ struct ou_jetty {
     struct ou_jfr* jfr;
     urma_target_jetty_t* remote;   // after bind/import
     // outstanding WRs awaiting completion (in-order)
-    struct { uint64_t user_ctx; uint32_t op; uint32_t len; void* local_va; uint32_t req; uint32_t waited; } out[MAX_OUT];
+    struct { uint64_t user_ctx; uint32_t op; uint32_t len; void* local_va; uint32_t req; uint32_t waited; int status; } out[MAX_OUT];
     int outh, outt;
 };
 
@@ -104,17 +158,43 @@ struct ou_ctx {
     struct ou_jfr*  the_jfr;
     struct ou_jfc*  the_jfc;
     pthread_mutex_t dlk;   // guards data shared with NIC background thread
+    struct { uint64_t va, len; uint32_t token; int active; } regions[1024];
+    struct { uint32_t req; int status; int valid; } pending_write_ack[MAX_OUT];
+    atomic_uint malformed_frames;
 };
 static void ou_data_cb(void* user, uint8_t tag, const uint8_t* buf, uint32_t flen);
 static inline struct ou_ctx* to_ou(urma_context_t* c){ return (struct ou_ctx*)c; }
 
 static urma_ops_t g_openurma_ops;
 
+static void ou_malformed(struct ou_ctx* c, uint8_t tag, uint32_t flen)
+{
+    unsigned count = atomic_fetch_add(&c->malformed_frames, 1) + 1;
+    /* Always expose integrity failures, but rate-limit hostile input. */
+    if (count == 1 || (count & (count - 1)) == 0) {
+        fprintf(stderr, "[openurma-prov] malformed data frame tag=0x%02x len=%u count=%u\n",
+                tag, flen, count);
+    }
+}
+
+static int ou_region_valid_locked(struct ou_ctx* c, uint64_t va, uint32_t len, uint32_t token)
+{
+    for (unsigned i = 0; i < 1024; ++i) {
+        if (!c->regions[i].active || c->regions[i].token != token || va < c->regions[i].va) continue;
+        uint64_t offset = va - c->regions[i].va;
+        if (offset <= c->regions[i].len && len <= c->regions[i].len - offset) return 1;
+    }
+    return 0;
+}
+
 // ====================================================================
 // provider_ops
 // ====================================================================
 static urma_status_t ou_init(urma_init_attr_t* c){ (void)c; PLOG("init"); return URMA_SUCCESS; }
-static urma_status_t ou_uninit(void){ PLOG("uninit"); return URMA_SUCCESS; }
+static urma_status_t ou_uninit(void){
+    PLOG("uninit");
+    return openurma_nic_shutdown_runtime() ? URMA_SUCCESS : URMA_FAIL;
+}
 static urma_status_t ou_query_device(urma_device_t* d, urma_device_attr_t* a){
     (void)d;
     if (a) {
@@ -140,11 +220,18 @@ static urma_context_t* ou_create_context(urma_device_t* dev, uint32_t eid_index,
     c->base.async_fd = -1; c->base.eid_index = eid_index;
     pthread_mutex_init(&c->base.mutex, NULL);
     atomic_init(&c->jetty_seq, 1); atomic_init(&c->token_seq, 1); atomic_init(&c->req_seq, 1);
+    atomic_init(&c->malformed_frames, 0);
     uint32_t cna = 0xABC000;
     if (dev && dev->name[0]) { uint32_t h=2166136261u; for(const char*p=dev->name;*p;++p){h^=(unsigned char)*p;h*=16777619u;} cna=h&0xFFFFFF; }
     c->local_cna = cna;
     pthread_mutex_init(&c->dlk, NULL);
     c->nic = openurma_nic_create(c->local_cna);
+    if (!c->nic) {
+        pthread_mutex_destroy(&c->dlk);
+        pthread_mutex_destroy(&c->base.mutex);
+        free(c);
+        return NULL;
+    }
     openurma_nic_set_data_cb(c->nic, ou_data_cb, c);
     PLOG("create_context dev=%s cna=0x%06x nic=%p", dev?dev->name:"?", cna, (void*)c->nic);
     return &c->base;
@@ -152,7 +239,11 @@ static urma_context_t* ou_create_context(urma_device_t* dev, uint32_t eid_index,
 static urma_status_t ou_delete_context(urma_context_t* ctx)
 {
     struct ou_ctx* c = to_ou(ctx);
-    if (c->nic) openurma_nic_destroy(c->nic);
+    if (c->nic) {
+        openurma_nic_set_data_cb(c->nic, NULL, NULL);
+        openurma_nic_destroy(c->nic);
+    }
+    pthread_mutex_destroy(&c->dlk);
     pthread_mutex_destroy(&c->base.mutex);
     free(c);
     return URMA_SUCCESS;
@@ -164,21 +255,50 @@ static urma_status_t ou_delete_context(urma_context_t* ctx)
 static void ou_data_cb(void* user, uint8_t tag, const uint8_t* buf, uint32_t flen)
 {
     struct ou_ctx* c = (struct ou_ctx*)user;
-    PLOG("data_cb tag=%c flen=%u", tag, flen);
+    if (!c || !buf) return;
+    TLOG("data_cb tag=%c flen=%u", tag, flen);
     if (tag == D_WRITE) {
-        uint64_t va; uint32_t len; memcpy(&va,buf,8); memcpy(&len,buf+8,4);
-        if (12u+len <= flen) memcpy((void*)(uintptr_t)va, buf+12, len);
+        if (flen < 20) { ou_malformed(c, tag, flen); return; }
+        uint64_t va; uint32_t token,len,req;
+        memcpy(&va,buf,8); memcpy(&token,buf+8,4); memcpy(&len,buf+12,4); memcpy(&req,buf+16,4);
+        pthread_mutex_lock(&c->dlk);
+        int valid = len <= flen - 20u && ou_region_valid_locked(c, va, len, token);
+        if (valid) memcpy((void*)(uintptr_t)va, buf+20, len);
+        pthread_mutex_unlock(&c->dlk);
+        uint32_t ack[2] = {req, valid ? 0u : (uint32_t)URMA_CR_REM_ACCESS_ABORT_ERR};
+        openurma_nic_data_send(c->nic, D_WRITEACK, ack, sizeof(ack));
+    } else if (tag == D_WRITEACK) {
+        if (flen < 8) { ou_malformed(c, tag, flen); return; }
+        uint32_t req,status; memcpy(&req,buf,4); memcpy(&status,buf+4,4);
+        pthread_mutex_lock(&c->dlk);
+        struct ou_jetty* j = c->the_jetty;
+        int matched = 0;
+        if (j) for (int i=j->outh; i!=j->outt; i=(i+1)%MAX_OUT) {
+            if (j->out[i].req == req && j->out[i].op == URMA_OPC_WRITE) {
+                j->out[i].status = (int)status; j->out[i].req = 0; matched = 1; break;
+            }
+        }
+        if (!matched) {
+            unsigned slot = req % MAX_OUT;
+            c->pending_write_ack[slot].req = req;
+            c->pending_write_ack[slot].status = (int)status;
+            c->pending_write_ack[slot].valid = 1;
+        }
+        pthread_mutex_unlock(&c->dlk);
     } else if (tag == D_SEND) {
+        if (flen < 8) { ou_malformed(c, tag, flen); return; }
         uint32_t dst,len; memcpy(&dst,buf,4); memcpy(&len,buf+4,4);
+        (void)dst;
+        if (len > flen - 8u) { ou_malformed(c, tag, flen); return; }
         pthread_mutex_lock(&c->dlk);
         struct ou_jfr* r = c->the_jfr;
         // RECV completions must land on the JFR's bound completion queue, NOT
         // the last-created jfc (URPC uses separate send/recv JFCs).
         struct ou_jfc* jfc = (r && r->base.jfr_cfg.jfc) ? (struct ou_jfc*)r->base.jfr_cfg.jfc : c->the_jfc;
-        if (r && r->rqh != r->rqt) {
+        if (r && jfc && r->rqh != r->rqt && (jfc->tail + 1) % MAX_OUT != jfc->head) {
             int i = r->rqh; r->rqh = (r->rqh+1)%MAX_RECV;
             uint32_t cp = len < r->rq[i].len ? len : r->rq[i].len;
-            if (8u+cp <= flen) memcpy(r->rq[i].buf, buf+8, cp);
+            if (cp != 0 && r->rq[i].buf) memcpy(r->rq[i].buf, buf+8, cp);
             if (jfc) {
                 urma_cr_t* cr = &jfc->cr[jfc->tail]; memset(cr,0,sizeof(*cr));
                 cr->status = URMA_CR_SUCCESS; cr->opcode = URMA_CR_OPC_SEND;
@@ -188,23 +308,51 @@ static void ou_data_cb(void* user, uint8_t tag, const uint8_t* buf, uint32_t fle
         }
         pthread_mutex_unlock(&c->dlk);
     } else if (tag == D_READRQ) {
-        uint64_t va; uint32_t len,req,scna;
-        memcpy(&va,buf,8); memcpy(&len,buf+8,4); memcpy(&req,buf+12,4); memcpy(&scna,buf+16,4);
-        uint8_t* rsp = malloc(8+len);
-        memcpy(rsp,&req,4); memcpy(rsp+4,&len,4); memcpy(rsp+8,(void*)(uintptr_t)va,len);
-        openurma_nic_data_send(c->nic, D_READRSP, rsp, 8+len); free(rsp);
+        if (flen < 24) { ou_malformed(c, tag, flen); return; }
+        uint64_t va; uint32_t token,len,req,scna;
+        memcpy(&va,buf,8); memcpy(&token,buf+8,4); memcpy(&len,buf+12,4);
+        memcpy(&req,buf+16,4); memcpy(&scna,buf+20,4);
+        pthread_mutex_lock(&c->dlk);
+        (void)scna;
+        int valid = len <= MAX_DATA_FRAME_BODY - 12u &&
+                    ou_region_valid_locked(c, va, len, token);
+        TLOG("read_req req=%u va=0x%lx len=%u token=%u valid=%d", req,
+             (unsigned long)va, len, token, valid);
+        uint32_t response_len = valid ? len : 0;
+        uint32_t status = valid ? 0u : (uint32_t)URMA_CR_REM_ACCESS_ABORT_ERR;
+        size_t rsp_size = 12u + (size_t)response_len;
+        uint8_t* rsp = malloc(rsp_size);
+        if (!rsp) {
+            response_len = 0;
+            status = (uint32_t)URMA_CR_REM_OPERATION_ERR;
+            rsp_size = 12;
+            rsp = malloc(rsp_size);
+        }
+        if (!rsp) { pthread_mutex_unlock(&c->dlk); return; }
+        memcpy(rsp,&req,4); memcpy(rsp+4,&response_len,4); memcpy(rsp+8,&status,4);
+        if (valid) memcpy(rsp+12,(void*)(uintptr_t)va,response_len);
+        pthread_mutex_unlock(&c->dlk);
+        openurma_nic_data_send(c->nic, D_READRSP, rsp, (uint32_t)rsp_size); free(rsp);
     } else if (tag == D_READRSP) {
-        uint32_t req,len; memcpy(&req,buf,4); memcpy(&len,buf+4,4);
+        if (flen < 12) { ou_malformed(c, tag, flen); return; }
+        uint32_t req,len,status; memcpy(&req,buf,4); memcpy(&len,buf+4,4); memcpy(&status,buf+8,4);
         pthread_mutex_lock(&c->dlk);
         struct ou_jetty* j = c->the_jetty;
+        int matched = 0;
         if (j) for (int i=j->outh; i!=j->outt; i=(i+1)%MAX_OUT) {
             if (j->out[i].req == req && j->out[i].local_va) {
                 uint32_t cp = len < j->out[i].len ? len : j->out[i].len;
-                if (8u+cp <= flen) memcpy(j->out[i].local_va, buf+8, cp);
-                j->out[i].req = 0; break;
+                if (status == 0 && (len != j->out[i].len || len > flen - 12u)) {
+                    status = (uint32_t)URMA_CR_REM_RESP_LEN_ERR;
+                }
+                if (status == 0 && cp != 0) memcpy(j->out[i].local_va, buf+12, cp);
+                j->out[i].status = (int)status; j->out[i].req = 0; matched = 1; break;
             }
         }
+        TLOG("read_rsp req=%u len=%u status=%u matched=%d", req, len, status, matched);
         pthread_mutex_unlock(&c->dlk);
+    } else {
+        ou_malformed(c, tag, flen);
     }
 }
 
@@ -215,6 +363,7 @@ static urma_jfc_t* ou_create_jfc(urma_context_t* ctx, urma_jfc_cfg_t* cfg)
 {
     struct ou_ctx* c = to_ou(ctx);
     struct ou_jfc* j = calloc(1,sizeof(*j));
+    if (!j) return NULL;
     j->base.urma_ctx = ctx; if(cfg) j->base.jfc_cfg = *cfg;
     j->base.jfc_id.eid = ctx->eid; j->base.jfc_id.id = atomic_fetch_add(&c->jetty_seq,1);
     pthread_mutex_init(&j->lk,NULL);
@@ -222,12 +371,16 @@ static urma_jfc_t* ou_create_jfc(urma_context_t* ctx, urma_jfc_cfg_t* cfg)
     PLOG("create_jfc id=%u", j->base.jfc_id.id);
     return &j->base;
 }
-static urma_status_t ou_delete_jfc(urma_jfc_t* jfc){ free(jfc); return URMA_SUCCESS; }
+static urma_status_t ou_delete_jfc(urma_jfc_t* jfc){
+    if (jfc) pthread_mutex_destroy(&((struct ou_jfc*)jfc)->lk);
+    free(jfc); return URMA_SUCCESS;
+}
 
 static urma_jfr_t* ou_create_jfr(urma_context_t* ctx, urma_jfr_cfg_t* cfg)
 {
     struct ou_ctx* c = to_ou(ctx);
     struct ou_jfr* r = calloc(1,sizeof(*r));
+    if (!r) return NULL;
     r->base.urma_ctx = ctx; if(cfg) r->base.jfr_cfg = *cfg;
     r->base.jfr_id.eid = ctx->eid; r->base.jfr_id.id = atomic_fetch_add(&c->jetty_seq,1);
     c->the_jfr = r;
@@ -241,6 +394,7 @@ static urma_jetty_t* ou_create_jetty(urma_context_t* ctx, urma_jetty_cfg_t* cfg)
 {
     struct ou_ctx* c = to_ou(ctx);
     struct ou_jetty* j = calloc(1,sizeof(*j));
+    if (!j) return NULL;
     j->base.urma_ctx = ctx; if(cfg) j->base.jetty_cfg = *cfg;
     j->base.jetty_id.eid = ctx->eid;
     j->base.jetty_id.uasid = c->local_cna;
@@ -260,6 +414,7 @@ static urma_target_jetty_t* ou_import_jetty(urma_context_t* ctx, urma_rjetty_t* 
 {
     (void)tk;
     urma_target_jetty_t* t = calloc(1,sizeof(*t));
+    if (!t || !rj) { free(t); return NULL; }
     t->urma_ctx = ctx; t->id = rj->jetty_id; t->trans_mode = rj->trans_mode;
     PLOG("import_jetty remote cna=0x%x jid=%u", rj->jetty_id.uasid, rj->jetty_id.id);
     return t;
@@ -273,27 +428,58 @@ static urma_status_t ou_bind_jetty(urma_jetty_t* jb, urma_target_jetty_t* t)
     PLOG("bind_jetty local=%u -> remote cna=0x%x jid=%u", jb->jetty_id.id, t->id.uasid, t->id.id);
     return URMA_SUCCESS;
 }
-static urma_status_t ou_unbind_jetty(urma_jetty_t* jb){ ((struct ou_jetty*)jb)->remote=NULL; return URMA_SUCCESS; }
+static urma_status_t ou_unbind_jetty(urma_jetty_t* jb)
+{
+    ((struct ou_jetty*)jb)->remote = NULL;
+    jb->remote_jetty = NULL;
+    return URMA_SUCCESS;
+}
 
 static urma_target_seg_t* ou_register_seg(urma_context_t* ctx, urma_seg_cfg_t* cfg)
 {
     struct ou_ctx* c = to_ou(ctx);
     urma_target_seg_t* s = calloc(1,sizeof(*s));
+    if (!s || !cfg || cfg->va == 0 || cfg->len == 0) { free(s); return NULL; }
     s->urma_ctx = ctx;
+    s->token_id = cfg->token_id;
     s->seg.ubva.va = cfg->va; s->seg.len = cfg->len;
     s->seg.ubva.eid = ctx->eid; s->seg.ubva.uasid = c->local_cna;
     s->seg.token_id = atomic_fetch_add(&c->token_seq,1) & 0x3F;  // permissive MR table has 64 slots
-    PLOG("register_seg va=0x%lx len=%lu token_id=%u", (unsigned long)cfg->va, (unsigned long)cfg->len, s->seg.token_id);
+    pthread_mutex_lock(&c->dlk);
+    int stored = 0;
+    for (unsigned i = 0; i < 1024; ++i) if (!c->regions[i].active) {
+        c->regions[i].va = cfg->va; c->regions[i].len = cfg->len;
+        c->regions[i].token = s->seg.token_id; c->regions[i].active = 1;
+        stored = 1; break;
+    }
+    pthread_mutex_unlock(&c->dlk);
+    if (!stored) { free(s); return NULL; }
+    TLOG("register_seg va=0x%lx len=%lu token_id=%u", (unsigned long)cfg->va, (unsigned long)cfg->len, s->seg.token_id);
     return s;
 }
-static urma_status_t ou_unregister_seg(urma_target_seg_t* s){ free(s); return URMA_SUCCESS; }
+static urma_status_t ou_unregister_seg(urma_target_seg_t* s){
+    if (!s) return URMA_SUCCESS;
+    struct ou_ctx* c = to_ou(s->urma_ctx);
+    pthread_mutex_lock(&c->dlk);
+    int found = 0;
+    for (unsigned i = 0; i < 1024; ++i) {
+        if (c->regions[i].active && c->regions[i].va == s->seg.ubva.va &&
+            c->regions[i].token == s->seg.token_id) {
+            c->regions[i].active = 0; found = 1; break;
+        }
+    }
+    pthread_mutex_unlock(&c->dlk);
+    if (!found) return URMA_FAIL;
+    free(s); return URMA_SUCCESS;
+}
 
 static urma_target_seg_t* ou_import_seg(urma_context_t* ctx, urma_seg_t* seg, urma_token_t* tk, uint64_t addr, urma_import_seg_flag_t fl)
 {
     (void)tk;(void)fl;
     urma_target_seg_t* s = calloc(1,sizeof(*s));
+    if (!s || !seg || seg->ubva.va == 0 || seg->len == 0) { free(s); return NULL; }
     s->urma_ctx = ctx; s->seg = *seg; s->mva = addr ? addr : seg->ubva.va;
-    PLOG("import_seg remote va=0x%lx len=%lu token_id=%u", (unsigned long)seg->ubva.va, (unsigned long)seg->len, seg->token_id);
+    TLOG("import_seg remote va=0x%lx len=%lu token_id=%u", (unsigned long)seg->ubva.va, (unsigned long)seg->len, seg->token_id);
     return s;
 }
 static urma_status_t ou_unimport_seg(urma_target_seg_t* s){ free(s); return URMA_SUCCESS; }
@@ -302,6 +488,7 @@ static urma_token_id_t* ou_alloc_token_id(urma_context_t* ctx)
 {
     struct ou_ctx* c = to_ou(ctx);
     urma_token_id_t* t = calloc(1,sizeof(*t));
+    if (!t) return NULL;
     t->urma_ctx = ctx; t->token_id = atomic_fetch_add(&c->token_seq,1) & 0x3F;
     return t;
 }
@@ -338,8 +525,14 @@ static void ou_build_wr_flits(uint8_t meta[64], uint8_t ext[64],
 
 static urma_status_t ou_post_one(struct ou_ctx* c, struct ou_jetty* j, urma_jfs_wr_t* wr)
 {
+    if (!c || !c->nic || !j || !wr) return URMA_EINVAL;
+    pthread_mutex_lock(&c->dlk);
+    int ring_full = ((j->outt + 1) % MAX_OUT) == j->outh;
+    pthread_mutex_unlock(&c->dlk);
+    if (ring_full) return URMA_EAGAIN;
     uint32_t tassn = (uint32_t)((j->outt) & 0xFFFF);
     uint8_t taop; uint64_t rva=0; uint32_t tid=0, len=0; void* lva=0; uint32_t req=0;
+    uint8_t side_tag=0; uint8_t* side_data=NULL; uint32_t side_len=0;
     switch (wr->opcode) {
     case URMA_OPC_WRITE: case URMA_OPC_WRITE_IMM: {
         taop = TAOP_WRITE;
@@ -347,10 +540,16 @@ static urma_status_t ou_post_one(struct ou_ctx* c, struct ou_jetty* j, urma_jfs_
         len = wr->rw.src.sge ? wr->rw.src.sge[0].len : 0;
         tid = (wr->rw.dst.sge && wr->rw.dst.sge[0].tseg) ? wr->rw.dst.sge[0].tseg->seg.token_id : 0;
         void* sva = wr->rw.src.sge ? (void*)(uintptr_t)wr->rw.src.sge[0].addr : 0;
-        // data side-channel: [remote_va u64][len u32][bytes]
+        if (!sva || len == 0) return URMA_EINVAL;
+        req = atomic_fetch_add(&c->req_seq,1);
+        // data side-channel: [remote_va u64][token u32][len u32][req u32][bytes]
         if (sva && len) {
-            uint8_t* d = malloc(12+len); memcpy(d,&rva,8); memcpy(d+8,&len,4); memcpy(d+12,sva,len);
-            openurma_nic_data_send(c->nic, D_WRITE, d, 12+len); free(d);
+            if (len > MAX_DATA_FRAME_BODY - 20u) return URMA_EINVAL;
+            uint8_t* d = malloc(20u + (size_t)len);
+            if (!d) return URMA_ENOMEM;
+            memcpy(d,&rva,8); memcpy(d+8,&tid,4);
+            memcpy(d+12,&len,4); memcpy(d+16,&req,4); memcpy(d+20,sva,len);
+            side_tag=D_WRITE; side_data=d; side_len=20+len;
         }
         break; }
     case URMA_OPC_READ: {
@@ -360,17 +559,25 @@ static urma_status_t ou_post_one(struct ou_ctx* c, struct ou_jetty* j, urma_jfs_
         tid = (wr->rw.src.sge && wr->rw.src.sge[0].tseg) ? wr->rw.src.sge[0].tseg->seg.token_id : 0;
         lva = wr->rw.dst.sge ? (void*)(uintptr_t)wr->rw.dst.sge[0].addr : 0;  // local dest
         req = atomic_fetch_add(&c->req_seq,1);
-        uint8_t d[20]; memcpy(d,&rva,8); memcpy(d+8,&len,4); memcpy(d+12,&req,4); memcpy(d+16,&c->local_cna,4);
-        openurma_nic_data_send(c->nic, D_READRQ, d, 20);
+        if (!lva || len == 0 || len > MAX_DATA_FRAME_BODY - 12u) return URMA_EINVAL;
+        uint8_t* d = malloc(24);
+        if (!d) return URMA_ENOMEM;
+        memcpy(d,&rva,8); memcpy(d+8,&tid,4); memcpy(d+12,&len,4);
+        memcpy(d+16,&req,4); memcpy(d+20,&c->local_cna,4);
+        side_tag=D_READRQ; side_data=d; side_len=24;
         break; }
     case URMA_OPC_SEND: case URMA_OPC_SEND_IMM: {
         taop = TAOP_SEND;
         len = wr->send.src.sge ? wr->send.src.sge[0].len : 0;
         void* sva = wr->send.src.sge ? (void*)(uintptr_t)wr->send.src.sge[0].addr : 0;
+        if (!sva || len == 0) return URMA_EINVAL;
         uint32_t dst = j->remote ? j->remote->id.id : 0;
         if (sva && len) {
-            uint8_t* d = malloc(8+len); memcpy(d,&dst,4); memcpy(d+4,&len,4); memcpy(d+8,sva,len);
-            openurma_nic_data_send(c->nic, D_SEND, d, 8+len); free(d);
+            if (len > MAX_DATA_FRAME_BODY - 8u) return URMA_EINVAL;
+            uint8_t* d = malloc(8u + (size_t)len);
+            if (!d) return URMA_ENOMEM;
+            memcpy(d,&dst,4); memcpy(d+4,&len,4); memcpy(d+8,sva,len);
+            side_tag=D_SEND; side_data=d; side_len=8+len;
         }
         break; }
     case URMA_OPC_CAS: default:
@@ -379,8 +586,10 @@ static urma_status_t ou_post_one(struct ou_ctx* c, struct ou_jetty* j, urma_jfs_
     uint32_t dcna = j->remote ? j->remote->id.uasid : c->local_cna;
     uint8_t meta[64], ext[64];
     ou_build_wr_flits(meta, ext, dcna, taop, tassn, rva, tid, len);
-    openurma_nic_submit_wr(c->nic, meta);
-    openurma_nic_submit_wr(c->nic, ext);
+    if (!openurma_nic_submit_wr(c->nic, meta) || !openurma_nic_submit_wr(c->nic, ext)) {
+        free(side_data);
+        return URMA_EAGAIN;
+    }
     // record outstanding WR
     pthread_mutex_lock(&c->dlk);
     j->out[j->outt].user_ctx = wr->user_ctx;
@@ -388,6 +597,16 @@ static urma_status_t ou_post_one(struct ou_ctx* c, struct ou_jetty* j, urma_jfs_
     j->out[j->outt].local_va = lva; j->out[j->outt].req = req; j->out[j->outt].waited = 0;
     j->outt = (j->outt+1)%MAX_OUT;
     pthread_mutex_unlock(&c->dlk);
+    if (side_data) {
+        if (!openurma_nic_data_send(c->nic, side_tag, side_data, side_len)) {
+            pthread_mutex_lock(&c->dlk);
+            int slot = (j->outt + MAX_OUT - 1) % MAX_OUT;
+            j->out[slot].status = URMA_CR_ACK_TIMEOUT_ERR;
+            j->out[slot].req = 0;
+            pthread_mutex_unlock(&c->dlk);
+        }
+        free(side_data);
+    }
     openurma_nic_pump(c->nic, 50);
     return URMA_SUCCESS;
 }
@@ -418,7 +637,11 @@ static urma_status_t ou_post_jetty_recv_wr(urma_jetty_t* jb, urma_jfr_wr_t* wr, 
     (void)bad;
     pthread_mutex_lock(&c->dlk);
     for (urma_jfr_wr_t* w = wr; w; w = w->next) {
-        if (!r) break;
+        if (!r || (r->rqt + 1) % MAX_RECV == r->rqh) {
+            if (bad) *bad = w;
+            pthread_mutex_unlock(&c->dlk);
+            return URMA_EAGAIN;
+        }
         r->rq[r->rqt].buf = w->src.sge ? (void*)(uintptr_t)w->src.sge[0].addr : 0;
         r->rq[r->rqt].len = w->src.sge ? w->src.sge[0].len : 0;
         r->rq[r->rqt].user_ctx = w->user_ctx;
@@ -432,6 +655,11 @@ static urma_status_t ou_post_jfr_wr(urma_jfr_t* rb, urma_jfr_wr_t* wr, urma_jfr_
     struct ou_jfr* r = (struct ou_jfr*)rb; struct ou_ctx* c = to_ou(rb->urma_ctx); (void)bad;
     pthread_mutex_lock(&c->dlk);
     for (urma_jfr_wr_t* w = wr; w; w = w->next) {
+        if ((r->rqt + 1) % MAX_RECV == r->rqh) {
+            if (bad) *bad = w;
+            pthread_mutex_unlock(&c->dlk);
+            return URMA_EAGAIN;
+        }
         r->rq[r->rqt].buf = w->src.sge ? (void*)(uintptr_t)w->src.sge[0].addr : 0;
         r->rq[r->rqt].len = w->src.sge ? w->src.sge[0].len : 0;
         r->rq[r->rqt].user_ctx = w->user_ctx;
@@ -453,6 +681,7 @@ static int ou_poll_jfc(urma_jfc_t* jfc, int cr_cnt, urma_cr_t* cr)
     // Harvest SC-pipeline completion descriptor flits.
     int sc_cqe = 0; uint8_t fl[64];
     while (openurma_nic_poll_cqe(c->nic, fl)) if (fl[32] & 0x01) sc_cqe++;
+    int wire_error = openurma_nic_failed(c->nic);
 
     pthread_mutex_lock(&c->dlk);
     // Deliver completions for the oldest outstanding WRs, in order. RC is
@@ -465,12 +694,29 @@ static int ou_poll_jfc(urma_jfc_t* jfc, int cr_cnt, urma_cr_t* cr)
     struct ou_jfc* sjfc = (j && j->jfc) ? j->jfc : jc;
     if (j) while (j->outh != j->outt) {
         int i = j->outh;
-        if (j->out[i].op == URMA_OPC_READ && j->out[i].req != 0) break;
-        int ready = (sc_cqe > 0) || (++j->out[i].waited > backstop());
+        if (wire_error != 0) {
+            j->out[i].status = URMA_CR_ACK_TIMEOUT_ERR;
+            j->out[i].req = 0;
+        }
+        if (j->out[i].op == URMA_OPC_WRITE && j->out[i].req != 0) {
+            unsigned slot = j->out[i].req % MAX_OUT;
+            if (c->pending_write_ack[slot].valid &&
+                c->pending_write_ack[slot].req == j->out[i].req) {
+                j->out[i].status = c->pending_write_ack[slot].status;
+                j->out[i].req = 0;
+                c->pending_write_ack[slot].valid = 0;
+            }
+        }
+        if ((j->out[i].op == URMA_OPC_READ || j->out[i].op == URMA_OPC_WRITE) &&
+            j->out[i].req != 0) break;
+        int ready = wire_error != 0 || (sc_cqe > 0) || (++j->out[i].waited > backstop());
         if (!ready) break;
+        if ((sjfc->tail + 1) % MAX_OUT == sjfc->head) break;
         if (sc_cqe > 0) sc_cqe--;
         urma_cr_t* o = &sjfc->cr[sjfc->tail]; memset(o,0,sizeof(*o));
-        o->status = URMA_CR_SUCCESS; o->user_ctx = j->out[i].user_ctx;
+        o->status = j->out[i].status == 0 ? URMA_CR_SUCCESS :
+                    (urma_cr_status_t)j->out[i].status;
+        o->user_ctx = j->out[i].user_ctx;
         o->opcode = (j->out[i].op==URMA_OPC_SEND)?URMA_CR_OPC_SEND:0;
         o->completion_len = j->out[i].len;
         sjfc->tail = (sjfc->tail+1)%MAX_OUT;

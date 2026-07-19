@@ -14,10 +14,19 @@ paper/*.tar.gz
 
 # Editor / tooling
 .claude/
+.metals/
+.vscode/
+.idea/
 
 # Python caches
 __pycache__/
 *.pyc
+
+# Local validation output and crash/runtime artifacts
+artifacts/
+target/
+hs_err_pid*.log
+initramfs.cpio.gz
 
 # --- gem5 scaffold (eval/twonode/gem5_scaffold) build artifacts ---
 # Kernel-module build leftovers

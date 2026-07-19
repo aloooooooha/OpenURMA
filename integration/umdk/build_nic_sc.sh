@@ -7,7 +7,7 @@ OUT_OBJ="${1:?output object path}"
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"          # OpenURMA root
-OCN="${OPENCLICKNP_ROOT:-/home/ubuntu/OpenClickNP}"
+OCN="${OPENCLICKNP_ROOT:?OPENCLICKNP_ROOT must point to the OpenClickNP source tree}"
 GEN="$ROOT/build/openurma_gen/systemc"
 FACADE_O="$ROOT/build/sc/openurma_sc_facade.o"
 
@@ -18,10 +18,10 @@ if [[ ! -f "$FACADE_O" ]]; then
 fi
 
 echo "[nic-sc] compiling openurma_nic.cpp"
-g++ -std=c++17 -O2 -fPIC -DSC_INCLUDE_DYNAMIC_PROCESSES -w \
-    -I "$OCN/runtime/include" \
-    -I "$ROOT/runtime/openurma/include" \
-    -I "$GEN" \
+g++ -std=c++17 -O2 -fPIC -DSC_INCLUDE_DYNAMIC_PROCESSES -Wall -Wextra -Werror \
+    -isystem "$OCN/runtime/include" \
+    -isystem "$ROOT/runtime/openurma/include" \
+    -isystem "$GEN" \
     -I "$HERE/provider" \
     -include "openurma/ub_flit.hpp" \
     -c "$HERE/provider/openurma_nic.cpp" -o "$HERE/build/tier_s/openurma_nic_sc.o"

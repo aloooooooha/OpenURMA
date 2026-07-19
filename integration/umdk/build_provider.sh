@@ -20,12 +20,12 @@ URMA_INC="$UMDK/src/urma/lib/urma/core/include"
 COMMON_INC="$UMDK/src/urma/common/include"
 LIBURMA="$UMDK_BUILD/urma/lib/urma/core"
 LIBCOMMON="$UMDK_BUILD/urma/common"
-LFLAGS="-L$LIBURMA -L$LIBCOMMON -lurma -lurma_common -Wl,-rpath,$LIBURMA -Wl,-rpath,$LIBCOMMON"
+LFLAGS="-L$LIBURMA -L$LIBCOMMON -lurma -lurma_common"
 
 [[ -f "$LIBURMA/liburma.so" ]] || { echo "build UMDK first: ./build_umdk.sh" >&2; exit 1; }
 
 echo "== openurma_shim.so =="
-gcc -O2 -fPIC -shared -Wall -o "$OUT/openurma_shim.so" \
+gcc -O2 -fPIC -shared -Wall -Wextra -Werror -Wl,--build-id=sha1 -o "$OUT/openurma_shim.so" \
     "$HERE/shim/openurma_shim.c" -ldl
 
 echo "== NIC backend ($NIC_IMPL) =="
@@ -33,19 +33,19 @@ NIC_OBJ="$OUT/openurma_nic.o"
 if [[ "$NIC_IMPL" == "sc" ]]; then
     "$HERE/build_nic_sc.sh" "$NIC_OBJ"
 else
-    gcc -O2 -fPIC -Wall -c -o "$NIC_OBJ" "$HERE/provider/openurma_nic_stub.c" \
+    gcc -O2 -fPIC -Wall -Wextra -Werror -c -o "$NIC_OBJ" "$HERE/provider/openurma_nic_stub.c" \
         -I"$HERE/provider"
 fi
 
 echo "== liburma_openurma.so (provider) =="
 # Provider filename MUST start with "liburma" (urma_validate_driver) and be
 # staged in <dir-of-liburma.so>/urma (derived via dladdr in urma_open_drivers).
-gcc -O2 -fPIC -Wall -c -o "$OUT/openurma_provider.o" \
+gcc -O2 -fPIC -Wall -Wextra -Werror -c -o "$OUT/openurma_provider.o" \
     "$HERE/provider/openurma_provider.c" \
     -I"$URMA_INC" -I"$COMMON_INC" -I"$HERE/provider"
 EXTRA_LIBS=""
 [[ "$NIC_IMPL" == "sc" ]] && EXTRA_LIBS="-lstdc++ -lsystemc -lpthread"
-g++ -shared -o "$OUT/liburma_openurma.so" \
+g++ -shared -Wl,--build-id=sha1 -o "$OUT/liburma_openurma.so" \
     "$OUT/openurma_provider.o" "$NIC_OBJ" \
     $LFLAGS -lpthread $EXTRA_LIBS
 
@@ -56,7 +56,7 @@ ln -sf "$OUT/liburma_openurma.so" "$PROV_DIR/liburma_openurma.so"
 echo "staged provider -> $PROV_DIR/liburma_openurma.so"
 
 echo "== list_devices probe =="
-gcc -O2 -Wall -o "$OUT/list_devices" "$HERE/tests/list_devices.c" \
+gcc -O2 -Wall -Wextra -Werror -Wl,--build-id=sha1 -o "$OUT/list_devices" "$HERE/tests/list_devices.c" \
     -I"$URMA_INC" -I"$COMMON_INC" $LFLAGS
 
 echo "Tier-S artifacts in $OUT"

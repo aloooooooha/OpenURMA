@@ -85,7 +85,7 @@ int main(int argc,char**argv){
 
     // SEND
     const char* SPAT="OpenURMA-SEND-hello"; uint32_t sl=strlen(SPAT)+1;
-    char* sbuf=aligned_alloc(4096,256); memcpy(sbuf,SPAT,sl);
+    char* sbuf=aligned_alloc(4096,4096); memcpy(sbuf,SPAT,sl);
     urma_sge_t sg2={.addr=(uint64_t)(uintptr_t)sbuf,.len=sl,.tseg=seg};
     urma_sg_t s2={.sge=&sg2,.num_sge=1};
     urma_jfs_wr_t w2; memset(&w2,0,sizeof w2);
@@ -96,7 +96,7 @@ int main(int argc,char**argv){
     printf("CLIENT: %s\n", (rc_ok==3)?"PASS (both completions)":"FAIL");
   } else {
     // SERVER: post a recv buffer for the incoming SEND, then poll/service.
-    char* rbuf=aligned_alloc(4096,256); memset(rbuf,0,256);
+    char* rbuf=aligned_alloc(4096,4096); memset(rbuf,0,256);
     urma_sge_t rsge={.addr=(uint64_t)(uintptr_t)rbuf,.len=256,.tseg=seg};
     urma_sg_t rsg={.sge=&rsge,.num_sge=1};
     urma_jfr_wr_t rw; memset(&rw,0,sizeof rw); rw.src=rsg; rw.user_ctx=0x900;

@@ -28,6 +28,10 @@ struct openurma_nic;
  * Returns NULL on the M1 stub or on failure (provider treats NULL as "no NIC"). */
 struct openurma_nic *openurma_nic_create(uint32_t local_cna);
 void                 openurma_nic_destroy(struct openurma_nic *nic);
+/* Final process-runtime shutdown. Returns 1 on success and 0 while in use. */
+int                  openurma_nic_shutdown_runtime(void);
+/* Sticky asynchronous wire error (errno value), or 0 while healthy. */
+int                  openurma_nic_failed(struct openurma_nic *nic);
 
 /* Data plane (M3). Submit one 64-byte WR flit at the doorbell; drain one CQE
  * flit. Return 1 on success, 0 if none/full. */
@@ -42,9 +46,9 @@ void openurma_nic_pump(struct openurma_nic *nic, uint64_t budget_ns);
 /* Data side-channel (multiplexed on the same wire connection). The SC pipeline
  * carries UB protocol headers + timing; actual RDMA payload bytes are moved
  * here so the official apps' data-integrity checks pass. A frame is an opaque
- * blob with a 1-byte app type tag. send is best-effort; recv is drained by
- * pump into an internal queue and popped here. Returns bytes (recv) / 1 (send)
- * / 0 (none). */
+ * blob with a 1-byte app type tag. Queue admission is bounded and asynchronous
+ * wire failure is sticky/observable through openurma_nic_failed(). Returns
+ * bytes (recv) / 1 (accepted) / 0 (rejected). */
 int openurma_nic_data_send(struct openurma_nic *nic, uint8_t tag,
                            const void *buf, uint32_t len);
 int openurma_nic_data_recv(struct openurma_nic *nic, uint8_t *tag_out,

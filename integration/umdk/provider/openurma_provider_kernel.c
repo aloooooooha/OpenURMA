@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <pthread.h>
 #include <stdatomic.h>
+#include <stdarg.h>
 #include <errno.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -68,9 +69,57 @@ static inline void lane_set(uint8_t *f, int lane, int lo, int w, uint64_t v) {
 #define TAOP_READ 0x06
 #define NTH_NLP_RTPH 0x2
 
-static int g_log = -1;
-static inline int log_on(void){ if(g_log<0){const char*e=getenv("OPENURMA_PROVIDER_LOG");g_log=(e&&*e&&*e!='0')?1:0;} return g_log; }
-#define PLOG(...) do{ if(log_on()){fprintf(stderr,"[openurma-kprov] " __VA_ARGS__);fputc('\n',stderr);} }while(0)
+static int g_log_level = -1;
+static int g_trace_limit = -1;
+static atomic_uint g_trace_events;
+static inline int provider_log_level(void)
+{
+    if (g_log_level < 0) {
+        const char *value = getenv("OPENURMA_PROVIDER_LOG");
+        if (value == NULL || *value == '\0' || strcmp(value, "0") == 0 ||
+            strcmp(value, "off") == 0 || strcmp(value, "error") == 0) {
+            g_log_level = 0;
+        } else if (strcmp(value, "1") == 0 || strcmp(value, "summary") == 0) {
+            g_log_level = 1;
+        } else if (strcmp(value, "trace") == 0) {
+            g_log_level = 2;
+        } else {
+            fprintf(stderr, "[openurma-kprov] invalid OPENURMA_PROVIDER_LOG=%s; using off\n", value);
+            g_log_level = 0;
+        }
+    }
+    return g_log_level;
+}
+static inline unsigned provider_trace_limit(void)
+{
+    if (g_trace_limit < 0) {
+        const char *value = getenv("OPENURMA_PROVIDER_TRACE_LIMIT");
+        char *end = NULL;
+        unsigned long parsed = value ? strtoul(value, &end, 10) : 256ul;
+        g_trace_limit = value && (*value == '\0' || *end != '\0' || parsed > 100000ul)
+            ? 256 : (int)parsed;
+    }
+    return (unsigned)g_trace_limit;
+}
+static void provider_trace(const char *format, ...)
+{
+    unsigned index = atomic_fetch_add(&g_trace_events, 1);
+    unsigned limit = provider_trace_limit();
+    if (index > limit) return;
+    if (index == limit) {
+        fprintf(stderr, "[openurma-kprov] trace suppressed limit=%u\n", limit);
+        return;
+    }
+    va_list args;
+    va_start(args, format);
+    fprintf(stderr, "[openurma-kprov] ");
+    vfprintf(stderr, format, args);
+    fputc('\n', stderr);
+    va_end(args);
+}
+#define ELOG(...) do{fprintf(stderr,"[openurma-kprov] " __VA_ARGS__);fputc('\n',stderr);}while(0)
+#define PLOG(...) do{if(provider_log_level()>=1){fprintf(stderr,"[openurma-kprov] " __VA_ARGS__);fputc('\n',stderr);}}while(0)
+#define TLOG(...) do{if(provider_log_level()>=2){provider_trace(__VA_ARGS__);}}while(0)
 
 struct ou_ctx {
     urma_context_t base;          // first member
@@ -114,7 +163,7 @@ static urma_context_t* k_create_context(urma_device_t* dev, uint32_t eid_index, 
     urma_context_cfg_t cfg = { .dev = dev, .ops = &g_ops, .eid_index = eid_index, .dev_fd = dev_fd };
     urma_cmd_udrv_priv_t udata = {0};
     if (urma_cmd_create_context(&c->base, &cfg, &udata) != 0) {
-        PLOG("urma_cmd_create_context FAILED"); free(c); return NULL;
+        ELOG("urma_cmd_create_context FAILED"); free(c); return NULL;
     }
     atomic_init(&c->tassn, 0);
     atomic_init(&c->ldst_next, 0);
@@ -157,7 +206,7 @@ static urma_jfc_t* k_create_jfc(urma_context_t* ctx, urma_jfc_cfg_t* cfg)
     if (!j) return NULL;
     j->urma_ctx = ctx; j->jfc_cfg = *cfg;
     urma_cmd_udrv_priv_t u = {0};
-    if (urma_cmd_create_jfc(ctx, j, cfg, &u) != 0) { PLOG("create_jfc ioctl fail"); free(j); return NULL; }
+    if (urma_cmd_create_jfc(ctx, j, cfg, &u) != 0) { ELOG("create_jfc ioctl fail"); free(j); return NULL; }
     PLOG("create_jfc id=%u", j->jfc_id.id);
     return j;
 }
@@ -169,7 +218,7 @@ static urma_jfr_t* k_create_jfr(urma_context_t* ctx, urma_jfr_cfg_t* cfg)
     if (!r) return NULL;
     r->urma_ctx = ctx; r->jfr_cfg = *cfg;
     urma_cmd_udrv_priv_t u = {0};
-    if (urma_cmd_create_jfr(ctx, r, cfg, &u) != 0) { PLOG("create_jfr ioctl fail"); free(r); return NULL; }
+    if (urma_cmd_create_jfr(ctx, r, cfg, &u) != 0) { ELOG("create_jfr ioctl fail"); free(r); return NULL; }
     return r;
 }
 static urma_status_t k_delete_jfr(urma_jfr_t* r){ urma_cmd_delete_jfr(r); free(r); return URMA_SUCCESS; }
@@ -192,7 +241,7 @@ static urma_jetty_t* k_create_jetty(urma_context_t* ctx, urma_jetty_cfg_t* cfg)
     if (!j) return NULL;
     j->urma_ctx = ctx; j->jetty_cfg = *cfg;
     urma_cmd_udrv_priv_t u = {0};
-    if (urma_cmd_create_jetty(ctx, j, cfg, &u) != 0) { PLOG("create_jetty ioctl fail"); free(j); return NULL; }
+    if (urma_cmd_create_jetty(ctx, j, cfg, &u) != 0) { ELOG("create_jetty ioctl fail"); free(j); return NULL; }
     if (cfg->flag.bs.share_jfr && cfg->shared.jfr) {
         unsigned i = atomic_fetch_add(&g_jfr_jetty_n, 1);
         if (i < 256) { g_jfr_jetty[i].jfr = cfg->shared.jfr; g_jfr_jetty[i].jetty_id = j->jetty_id.id; }
@@ -207,8 +256,9 @@ static urma_target_seg_t* k_register_seg(urma_context_t* ctx, urma_seg_cfg_t* cf
     urma_target_seg_t* s = calloc(1, sizeof(*s));
     if (!s) return NULL;
     s->urma_ctx = ctx;
+    s->token_id = cfg->token_id;
     urma_cmd_udrv_priv_t u = {0};
-    if (urma_cmd_register_seg(ctx, s, cfg, &u) != 0) { PLOG("register_seg ioctl fail"); free(s); return NULL; }
+    if (urma_cmd_register_seg(ctx, s, cfg, &u) != 0) { ELOG("register_seg ioctl fail"); free(s); return NULL; }
     // Real MR: keep the app's own buffer VA and register {token, va_base, len}
     // with the NIC in ONE flit. The NIC reads this process's page-table base
     // (TTBR0_EL1) itself and translates VAs on demand (IOMMU-style), so this is
@@ -234,7 +284,7 @@ static urma_target_seg_t* k_register_seg(urma_context_t* ctx, urma_seg_cfg_t* cf
         desc[0] = va; desc[1] = (uint64_t)token; desc[2] = len;
         for (int i = 0; i < 8; i++) mrdb[i] = desc[i];
         __sync_synchronize();
-        PLOG("register_seg va=0x%lx len=%lu token=%u (page-table translated)",
+        TLOG("register_seg va=0x%lx len=%lu token=%u (page-table translated)",
              (unsigned long)va, (unsigned long)len, token);
     }
     return s;
@@ -249,7 +299,7 @@ static urma_target_seg_t* k_import_seg(urma_context_t* ctx, urma_seg_t* seg, urm
     urma_import_tseg_cfg_t cfg = { .ubva = seg->ubva, .len = seg->len, .token_id = seg->token_id,
                                    .token = tk, .flag = fl, .mva = s->mva };
     urma_cmd_udrv_priv_t u = {0};
-    if (urma_cmd_import_seg(ctx, s, &cfg, &u) != 0) { PLOG("import_seg ioctl fail"); free(s); return NULL; }
+    if (urma_cmd_import_seg(ctx, s, &cfg, &u) != 0) { ELOG("import_seg ioctl fail"); free(s); return NULL; }
     return s;
 }
 static urma_status_t k_unimport_seg(urma_target_seg_t* s){ urma_cmd_unimport_seg(s); free(s); return URMA_SUCCESS; }
@@ -262,7 +312,7 @@ static urma_target_jetty_t* k_import_jetty(urma_context_t* ctx, urma_rjetty_t* r
     urma_tjetty_cfg_t cfg = { .jetty_id = rj->jetty_id, .flag = rj->flag, .token = tk,
                               .trans_mode = rj->trans_mode, .type = rj->type, .tp_type = rj->tp_type };
     urma_cmd_udrv_priv_t u = {0};
-    if (urma_cmd_import_jetty(ctx, t, &cfg, &u) != 0) { PLOG("import_jetty ioctl fail"); free(t); return NULL; }
+    if (urma_cmd_import_jetty(ctx, t, &cfg, &u) != 0) { ELOG("import_jetty ioctl fail"); free(t); return NULL; }
     return t;
 }
 static urma_status_t k_unimport_jetty(urma_target_jetty_t* t){ urma_cmd_unimport_jetty(t); free(t); return URMA_SUCCESS; }
@@ -275,7 +325,12 @@ static urma_status_t k_bind_jetty(urma_jetty_t* j, urma_target_jetty_t* t)
     PLOG("bind_jetty rc=%d", r);
     return r == 0 ? URMA_SUCCESS : URMA_FAIL;
 }
-static urma_status_t k_unbind_jetty(urma_jetty_t* j){ urma_cmd_unbind_jetty(j); return URMA_SUCCESS; }
+static urma_status_t k_unbind_jetty(urma_jetty_t* j)
+{
+    int ret = urma_cmd_unbind_jetty(j);
+    if (ret == 0) j->remote_jetty = NULL;
+    return ret == 0 ? URMA_SUCCESS : URMA_FAIL;
+}
 
 static urma_token_id_t* k_alloc_token_id(urma_context_t* ctx)
 {
@@ -369,8 +424,14 @@ static urma_status_t k_post_jetty_send_wr(urma_jetty_t* jb, urma_jfs_wr_t* wr, u
                  len, cmp, val, w->user_ctx, imm, order, send_jfc);
         volatile uint64_t* db = (volatile uint64_t*)(c->aper + c->ctx_base + DB_OFFSET);
         uint64_t* m = (uint64_t*)meta; uint64_t* e = (uint64_t*)ext;
-        for (int i=0;i<8;i++) db[i] = m[i]; __sync_synchronize();
-        for (int i=0;i<8;i++) db[i] = e[i]; __sync_synchronize();
+        for (int i = 0; i < 8; i++) {
+            db[i] = m[i];
+        }
+        __sync_synchronize();
+        for (int i = 0; i < 8; i++) {
+            db[i] = e[i];
+        }
+        __sync_synchronize();
     }
     if (bad) *bad = NULL;
     return URMA_SUCCESS;
@@ -399,7 +460,7 @@ static urma_status_t ou_ring_recv(struct ou_ctx* c, uint32_t jetty_id, uint32_t 
         volatile uint64_t* rdb = (volatile uint64_t*)(c->aper + c->ctx_base + RECV_DB_OFFSET);
         for (int i=0;i<8;i++) rdb[i] = desc[i];
         __sync_synchronize();
-        PLOG("ring_recv va=0x%lx token=%u jetty=%u uctx=0x%lx",
+        TLOG("ring_recv va=0x%lx token=%u jetty=%u uctx=0x%lx",
              (unsigned long)r_va, r_tok, jetty_id, (unsigned long)w->user_ctx);
     }
     if (bad) *bad = NULL;
