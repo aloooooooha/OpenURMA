@@ -1,0 +1,4 @@
+obj-m += openurma_vdev.o
+openurma_vdev-y := openurma_vdev_main.o openurma_vdev_debugfs.o \
+	openurma_vdev_control.o openurma_vdev_mr.o openurma_vdev_ring.o \
+	openurma_vdev_model.o
