@@ -28,19 +28,29 @@ Spark 3.5.7
 
 ## 3. 获取代码
 
+先按目标机实际目录设置路径；以下值只是示例，可放在任意本地磁盘或共享目录：
+
 ```bash
-mkdir -p /opt/ultrashuffle-src
-cd /opt/ultrashuffle-src
+export UB_DEPLOY_ROOT=/data/ultrashuffle
+export UB_SRC_ROOT=${UB_DEPLOY_ROOT}/src
+export UB_INSTALL_ROOT=${UB_DEPLOY_ROOT}/runtime
+export UB_SCACHE_SRC=${UB_SRC_ROOT}/SCache
+export UB_SPARK_SRC=${UB_SRC_ROOT}/spark-3.5-scache
+export UB_OPENURMA_SRC=${UB_SRC_ROOT}/OpenURMA
+export UB_JAVA_HOME=/path/to/jdk17
+export UB_UMDK_BUILD=/path/to/umdk/build
+
+mkdir -p "${UB_SRC_ROOT}" "${UB_INSTALL_ROOT}"
 
 git clone --depth 1 -b freeze/ub-ultrashuffle-phase8-20260720 \
-  https://github.com/ultra-shuffle/SCache.git
+  https://github.com/ultra-shuffle/SCache.git "${UB_SCACHE_SRC}"
 
 git clone --depth 1 -b freeze/ub-ultrashuffle-phase8-20260720 \
-  https://github.com/ultra-shuffle/spark-3.5-scache.git
+  https://github.com/ultra-shuffle/spark-3.5-scache.git "${UB_SPARK_SRC}"
 
 # 仅用于接口与验证资料，真机运行不依赖其模拟 provider
 git clone --depth 1 -b freeze/ub-ultrashuffle-phase8-20260720 \
-  https://github.com/aloooooooha/OpenURMA.git
+  https://github.com/aloooooooha/OpenURMA.git "${UB_OPENURMA_SRC}"
 ```
 
 `OpenURMA` 和 `SCache` 已公开。修改版 Spark 仓库需由 `ultra-shuffle` 组织管理员开放；开放前使用交付方提供的冻结源码包或二进制包，不能用原版 Spark 替代。
@@ -64,13 +74,13 @@ numactl --hardware
 ### 4.2 构建 JNI 和 SCache
 
 ```bash
-cd /opt/ultrashuffle-src/SCache
-export JAVA_HOME=/usr/lib/jvm/java-17-openjdk
-export OU_UMDK_BUILD=/opt/umdk/build
-export SPARK_URMA_INSTALL_PREFIX=/opt/ultrashuffle
+cd "${UB_SCACHE_SRC}"
+export JAVA_HOME=${UB_JAVA_HOME}
+export OU_UMDK_BUILD=${UB_UMDK_BUILD}
+export SPARK_URMA_INSTALL_PREFIX=${UB_INSTALL_ROOT}
 
 native/spark_urma/build_spark_urma.sh
-ldd /opt/ultrashuffle/lib/libSparkUrma.so
+ldd "${UB_INSTALL_ROOT}/lib/libSparkUrma.so"
 sbt publishM2
 scripts/build-release.sh
 ```
@@ -80,7 +90,7 @@ scripts/build-release.sh
 ### 4.3 构建 Spark
 
 ```bash
-cd /opt/ultrashuffle-src/spark-3.5-scache
+cd "${UB_SPARK_SRC}"
 ./build/mvn -DskipTests -Phadoop-3 -Pscala-2.13 package
 ```
 
@@ -118,9 +128,10 @@ spark.scache.strict=true
 spark.scache.shuffle.noLocalFiles=true
 spark.shuffle.useOldFetchProtocol=true
 spark.scache.productionFallback.enabled=false
+spark.scache.home=<SCache实际安装目录>
 spark.scache.jars=<SCache-assembly.jar>
-spark.driver.extraLibraryPath=/opt/ultrashuffle/lib:/opt/umdk/lib
-spark.executor.extraLibraryPath=/opt/ultrashuffle/lib:/opt/umdk/lib
+spark.driver.extraLibraryPath=<JNI库目录>:<UMDK库目录>:<UMDK公共库目录>
+spark.executor.extraLibraryPath=<JNI库目录>:<UMDK库目录>:<UMDK公共库目录>
 ```
 
 当前适配层若仍要求兼容字段，两端分别配置 `listen`/`connect`，并令配置与环境变量一致：
@@ -133,7 +144,7 @@ export OPENURMA_WIRE_PATH=hardware
 ## 6. 启动与验收
 
 ```bash
-cd /opt/ultrashuffle-src/SCache
+cd "${UB_SCACHE_SRC}"
 sbin/start-scache.sh
 ```
 
