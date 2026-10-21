@@ -114,7 +114,7 @@ static void provider_trace(const char *format, ...)
 // ---- data side-channel tags ----
 #define D_WRITE 'W'   // [remote_va u64][token u32][len u32][req u32][bytes]
 #define D_WRITEACK 'A' // [req u32][status u32]
-#define D_SEND  'S'   // [dst_jid u32][len u32][bytes]
+#define D_SEND  'S'   // [dst_jid u32][len u32][source urma_jetty_id_t][bytes]
 #define D_READRQ 'R'  // [remote_va u64][token u32][len u32][req u32][src_cna u32]
 #define D_READRSP 'r' // [req u32][len u32][status u32][bytes]
 
@@ -155,6 +155,7 @@ struct ou_ctx {
     atomic_uint req_seq;
     // single-jetty fast path bookkeeping
     struct ou_jetty* the_jetty;     // last created jetty (demo: one jetty)
+    struct ou_jetty* jettys[64];    // bounded simulator endpoint routing table
     struct ou_jfr*  the_jfr;
     struct ou_jfc*  the_jfc;
     pthread_mutex_t dlk;   // guards data shared with NIC background thread
@@ -217,7 +218,12 @@ static urma_context_t* ou_create_context(urma_device_t* dev, uint32_t eid_index,
     struct ou_ctx* c = calloc(1, sizeof(*c));
     if (!c) return NULL;
     c->base.dev = dev; c->base.ops = &g_openurma_ops; c->base.dev_fd = dev_fd;
-    c->base.async_fd = -1; c->base.eid_index = eid_index;
+    /* Framework epolls device async events even in polling mode. This
+     * simulated device has no generated fatal events yet, but must expose
+     * a real, non-readable fd rather than the discovery-only stub's -1. */
+    c->base.async_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (c->base.async_fd < 0) { free(c); return NULL; }
+    c->base.eid_index = eid_index;
     pthread_mutex_init(&c->base.mutex, NULL);
     atomic_init(&c->jetty_seq, 1); atomic_init(&c->token_seq, 1); atomic_init(&c->req_seq, 1);
     atomic_init(&c->malformed_frames, 0);
@@ -229,6 +235,7 @@ static urma_context_t* ou_create_context(urma_device_t* dev, uint32_t eid_index,
     if (!c->nic) {
         pthread_mutex_destroy(&c->dlk);
         pthread_mutex_destroy(&c->base.mutex);
+        close(c->base.async_fd);
         free(c);
         return NULL;
     }
@@ -245,6 +252,7 @@ static urma_status_t ou_delete_context(urma_context_t* ctx)
     }
     pthread_mutex_destroy(&c->dlk);
     pthread_mutex_destroy(&c->base.mutex);
+    close(c->base.async_fd);
     free(c);
     return URMA_SUCCESS;
 }
@@ -271,12 +279,14 @@ static void ou_data_cb(void* user, uint8_t tag, const uint8_t* buf, uint32_t fle
         if (flen < 8) { ou_malformed(c, tag, flen); return; }
         uint32_t req,status; memcpy(&req,buf,4); memcpy(&status,buf+4,4);
         pthread_mutex_lock(&c->dlk);
-        struct ou_jetty* j = c->the_jetty;
         int matched = 0;
+        for (unsigned k = 0; k < 64 && !matched; ++k) {
+        struct ou_jetty* j = c->jettys[k];
         if (j) for (int i=j->outh; i!=j->outt; i=(i+1)%MAX_OUT) {
             if (j->out[i].req == req && j->out[i].op == URMA_OPC_WRITE) {
                 j->out[i].status = (int)status; j->out[i].req = 0; matched = 1; break;
             }
+        }
         }
         if (!matched) {
             unsigned slot = req % MAX_OUT;
@@ -286,23 +296,32 @@ static void ou_data_cb(void* user, uint8_t tag, const uint8_t* buf, uint32_t fle
         }
         pthread_mutex_unlock(&c->dlk);
     } else if (tag == D_SEND) {
-        if (flen < 8) { ou_malformed(c, tag, flen); return; }
+        const uint32_t header = 8u + sizeof(urma_jetty_id_t);
+        if (flen < header) { ou_malformed(c, tag, flen); return; }
         uint32_t dst,len; memcpy(&dst,buf,4); memcpy(&len,buf+4,4);
-        (void)dst;
-        if (len > flen - 8u) { ou_malformed(c, tag, flen); return; }
+        if (len > flen - header) { ou_malformed(c, tag, flen); return; }
         pthread_mutex_lock(&c->dlk);
-        struct ou_jfr* r = c->the_jfr;
+        struct ou_jfr* r = NULL;
+        for (unsigned k = 0; k < 64; ++k) {
+            struct ou_jetty* target = c->jettys[k];
+            if (target && target->base.jetty_id.id == dst) { r = target->jfr; break; }
+        }
+        if (!r && dst == 0) r = c->the_jfr;
         // RECV completions must land on the JFR's bound completion queue, NOT
         // the last-created jfc (URPC uses separate send/recv JFCs).
         struct ou_jfc* jfc = (r && r->base.jfr_cfg.jfc) ? (struct ou_jfc*)r->base.jfr_cfg.jfc : c->the_jfc;
         if (r && jfc && r->rqh != r->rqt && (jfc->tail + 1) % MAX_OUT != jfc->head) {
             int i = r->rqh; r->rqh = (r->rqh+1)%MAX_RECV;
             uint32_t cp = len < r->rq[i].len ? len : r->rq[i].len;
-            if (cp != 0 && r->rq[i].buf) memcpy(r->rq[i].buf, buf+8, cp);
+            if (cp != 0 && r->rq[i].buf) memcpy(r->rq[i].buf, buf+header, cp);
             if (jfc) {
                 urma_cr_t* cr = &jfc->cr[jfc->tail]; memset(cr,0,sizeof(*cr));
                 cr->status = URMA_CR_SUCCESS; cr->opcode = URMA_CR_OPC_SEND;
                 cr->completion_len = cp; cr->user_ctx = r->rq[i].user_ctx;
+                memcpy(&cr->remote_id, buf+8, sizeof(cr->remote_id));
+                cr->local_id = dst;
+                cr->flag.bs.s_r = 1;
+                cr->flag.bs.jetty = 1;
                 jfc->tail = (jfc->tail+1)%MAX_OUT;
             }
         }
@@ -337,8 +356,9 @@ static void ou_data_cb(void* user, uint8_t tag, const uint8_t* buf, uint32_t fle
         if (flen < 12) { ou_malformed(c, tag, flen); return; }
         uint32_t req,len,status; memcpy(&req,buf,4); memcpy(&len,buf+4,4); memcpy(&status,buf+8,4);
         pthread_mutex_lock(&c->dlk);
-        struct ou_jetty* j = c->the_jetty;
         int matched = 0;
+        for (unsigned k = 0; k < 64 && !matched; ++k) {
+        struct ou_jetty* j = c->jettys[k];
         if (j) for (int i=j->outh; i!=j->outt; i=(i+1)%MAX_OUT) {
             if (j->out[i].req == req && j->out[i].local_va) {
                 uint32_t cp = len < j->out[i].len ? len : j->out[i].len;
@@ -348,6 +368,7 @@ static void ou_data_cb(void* user, uint8_t tag, const uint8_t* buf, uint32_t fle
                 if (status == 0 && cp != 0) memcpy(j->out[i].local_va, buf+12, cp);
                 j->out[i].status = (int)status; j->out[i].req = 0; matched = 1; break;
             }
+        }
         }
         TLOG("read_rsp req=%u len=%u status=%u matched=%d", req, len, status, matched);
         pthread_mutex_unlock(&c->dlk);
@@ -403,12 +424,29 @@ static urma_jetty_t* ou_create_jetty(urma_context_t* ctx, urma_jetty_cfg_t* cfg)
     // separate send/recv JFCs); fall back to the last-created jfc.
     j->jfc = (cfg && cfg->jfs_cfg.jfc) ? (struct ou_jfc*)cfg->jfs_cfg.jfc : c->the_jfc;
     j->jfr = (cfg && cfg->flag.bs.share_jfr && cfg->shared.jfr) ? (struct ou_jfr*)cfg->shared.jfr : c->the_jfr;
+    pthread_mutex_lock(&c->dlk);
+    unsigned slot;
+    for (slot = 0; slot < 64 && c->jettys[slot] != NULL; ++slot) {}
+    if (slot == 64) {
+        pthread_mutex_unlock(&c->dlk); free(j); errno = ENOSPC; return NULL;
+    }
+    c->jettys[slot] = j;
     c->the_jetty = j;
+    pthread_mutex_unlock(&c->dlk);
     PLOG("create_jetty id=%u cna=0x%06x", j->base.jetty_id.id, c->local_cna);
     return &j->base;
 }
 static urma_status_t ou_modify_jetty(urma_jetty_t* j, urma_jetty_attr_t* a){ (void)j;(void)a; return URMA_SUCCESS; }
-static urma_status_t ou_delete_jetty(urma_jetty_t* j){ free(j); return URMA_SUCCESS; }
+static urma_status_t ou_delete_jetty(urma_jetty_t* j){
+    if (!j) return URMA_SUCCESS;
+    struct ou_ctx* c = to_ou(j->urma_ctx);
+    pthread_mutex_lock(&c->dlk);
+    for (unsigned k = 0; k < 64; ++k)
+        if (c->jettys[k] == (struct ou_jetty*)j) c->jettys[k] = NULL;
+    if (c->the_jetty == (struct ou_jetty*)j) c->the_jetty = NULL;
+    pthread_mutex_unlock(&c->dlk);
+    free(j); return URMA_SUCCESS;
+}
 
 static urma_target_jetty_t* ou_import_jetty(urma_context_t* ctx, urma_rjetty_t* rj, urma_token_t* tk)
 {
@@ -573,11 +611,14 @@ static urma_status_t ou_post_one(struct ou_ctx* c, struct ou_jetty* j, urma_jfs_
         if (!sva || len == 0) return URMA_EINVAL;
         uint32_t dst = j->remote ? j->remote->id.id : 0;
         if (sva && len) {
-            if (len > MAX_DATA_FRAME_BODY - 8u) return URMA_EINVAL;
-            uint8_t* d = malloc(8u + (size_t)len);
+            const uint32_t header = 8u + sizeof(urma_jetty_id_t);
+            if (len > MAX_DATA_FRAME_BODY - header) return URMA_EINVAL;
+            uint8_t* d = malloc(header + (size_t)len);
             if (!d) return URMA_ENOMEM;
-            memcpy(d,&dst,4); memcpy(d+4,&len,4); memcpy(d+8,sva,len);
-            side_tag=D_SEND; side_data=d; side_len=8+len;
+            memcpy(d,&dst,4); memcpy(d+4,&len,4);
+            memcpy(d+8,&j->base.jetty_id,sizeof(urma_jetty_id_t));
+            memcpy(d+header,sva,len);
+            side_tag=D_SEND; side_data=d; side_len=header+len;
         }
         break; }
     case URMA_OPC_CAS: default:
@@ -688,7 +729,8 @@ static int ou_poll_jfc(urma_jfc_t* jfc, int cr_cnt, urma_cr_t* cr)
     // reliable + in-order: each WR completes exactly once, on a real SC
     // completion flit when available else on a bounded pump backstop. For READ,
     // also require the data-side-channel response (req cleared by ou_data_cb).
-    struct ou_jetty* j = c->the_jetty;
+    for (unsigned k = 0; k < 64; ++k) {
+    struct ou_jetty* j = c->jettys[k];
     // Send completions go to the jetty's send (jfs) JFC, which may differ from
     // the JFC being polled (URPC polls send/recv JFCs separately).
     struct ou_jfc* sjfc = (j && j->jfc) ? j->jfc : jc;
@@ -721,6 +763,7 @@ static int ou_poll_jfc(urma_jfc_t* jfc, int cr_cnt, urma_cr_t* cr)
         o->completion_len = j->out[i].len;
         sjfc->tail = (sjfc->tail+1)%MAX_OUT;
         j->outh = (j->outh+1)%MAX_OUT;
+    }
     }
     // Deliver from the CR queue (also holds RECV completions from ou_data_cb).
     int got=0;
