@@ -132,6 +132,7 @@ struct ou_jfc {
 };
 struct ou_jfr {
     urma_jfr_t base;
+    urma_jfr_state_t state;
     // posted recv buffers (for SEND target)
     struct { void* buf; uint32_t len; uint64_t user_ctx; } rq[MAX_RECV];
     int rqh, rqt;
@@ -404,11 +405,44 @@ static urma_jfr_t* ou_create_jfr(urma_context_t* ctx, urma_jfr_cfg_t* cfg)
     if (!r) return NULL;
     r->base.urma_ctx = ctx; if(cfg) r->base.jfr_cfg = *cfg;
     r->base.jfr_id.eid = ctx->eid; r->base.jfr_id.id = atomic_fetch_add(&c->jetty_seq,1);
+    r->state = URMA_JFR_STATE_READY;
     c->the_jfr = r;
     PLOG("create_jfr id=%u", r->base.jfr_id.id);
     return &r->base;
 }
-static urma_status_t ou_modify_jfr(urma_jfr_t* r, urma_jfr_attr_t* a){ (void)r;(void)a; return URMA_SUCCESS; }
+static urma_status_t ou_query_jfr(urma_jfr_t* rb, urma_jfr_cfg_t* cfg, urma_jfr_attr_t* attr) {
+    struct ou_jfr* r = (struct ou_jfr*)rb;
+    if (!r || !cfg || !attr) return URMA_EINVAL;
+    struct ou_ctx* c = to_ou(rb->urma_ctx);
+    pthread_mutex_lock(&c->dlk);
+    *cfg = rb->jfr_cfg;
+    memset(attr, 0, sizeof(*attr)); attr->state = r->state;
+    pthread_mutex_unlock(&c->dlk);
+    return URMA_SUCCESS;
+}
+static urma_status_t ou_modify_jfr(urma_jfr_t* rb, urma_jfr_attr_t* attr) {
+    if (!rb || !attr) return URMA_EINVAL;
+    struct ou_jfr* r = (struct ou_jfr*)rb;
+    struct ou_ctx* c = to_ou(rb->urma_ctx);
+    pthread_mutex_lock(&c->dlk);
+    if (attr->mask & JFR_STATE) r->state = attr->state;
+    if (r->state == URMA_JFR_STATE_ERROR && rb->jfr_cfg.jfc) {
+        struct ou_jfc* cq = (struct ou_jfc*)rb->jfr_cfg.jfc;
+        while (r->rqh != r->rqt) {
+            if ((cq->tail+1)%MAX_OUT == cq->head) {
+                pthread_mutex_unlock(&c->dlk); return URMA_EAGAIN;
+            }
+            urma_cr_t* cr = &cq->cr[cq->tail]; memset(cr,0,sizeof(*cr));
+            cr->status = URMA_CR_WR_FLUSH_ERR;
+            cr->flag.bs.s_r = 1;
+            cr->user_ctx = r->rq[r->rqh].user_ctx;
+            cq->tail=(cq->tail+1)%MAX_OUT;
+            r->rqh=(r->rqh+1)%MAX_RECV;
+        }
+    }
+    pthread_mutex_unlock(&c->dlk);
+    return URMA_SUCCESS;
+}
 static urma_status_t ou_delete_jfr(urma_jfr_t* r){ free(r); return URMA_SUCCESS; }
 
 static urma_jetty_t* ou_create_jetty(urma_context_t* ctx, urma_jetty_cfg_t* cfg)
@@ -805,6 +839,7 @@ static urma_ops_t g_openurma_ops = {
     .wait_jfc = ou_wait_jfc, .ack_jfc = ou_ack_jfc,
     .create_jfc = ou_create_jfc, .delete_jfc = ou_delete_jfc,
     .create_jfr = ou_create_jfr, .modify_jfr = ou_modify_jfr, .delete_jfr = ou_delete_jfr,
+    .query_jfr = ou_query_jfr,
     .create_jetty = ou_create_jetty, .modify_jetty = ou_modify_jetty, .delete_jetty = ou_delete_jetty,
     .import_jetty = ou_import_jetty, .unimport_jetty = ou_unimport_jetty,
     .bind_jetty = ou_bind_jetty, .unbind_jetty = ou_unbind_jetty,
